@@ -68,10 +68,40 @@ h1, h2, h3 { font-family: 'Syne', sans-serif !important; letter-spacing: -0.02em
 def load_data() -> dict:
     if not GIST_RAW_URL:
         return {}
-    import requests
-    resp = requests.get(GIST_RAW_URL, timeout=15)
+    import requests, json
+
+    resp = requests.get(
+        GIST_RAW_URL,
+        headers={
+            "Accept": "text/plain, application/json",
+            "Cache-Control": "no-cache",
+            "User-Agent": "padel-tracker-dashboard/1.0",
+        },
+        timeout=15,
+    )
     resp.raise_for_status()
-    return resp.json()
+
+    # If GitHub returned HTML instead of JSON (redirect/login page)
+    if "html" in resp.headers.get("Content-Type", ""):
+        st.error(
+            "GitHub returned an HTML page instead of JSON. "
+            "Check that GIST_RAW_URL uses the permanent /raw/ format "
+            "without a commit hash."
+        )
+        st.code(f"""URL: {GIST_RAW_URL}
+Content-Type: {resp.headers.get('Content-Type')}
+Preview: {resp.text[:300]}""")
+        return {}
+
+    try:
+        return resp.json()
+    except json.JSONDecodeError:
+        # Gist initialised but poller has not run yet
+        st.info(
+            f"Gist found but no tracking data yet — Railway poller may not have run.\n\n"
+            f"Raw content: `{resp.text[:300]}`"
+        )
+        return {}
 
 
 def slots_to_df(slots: list) -> pd.DataFrame:
