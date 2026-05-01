@@ -208,7 +208,7 @@ if not slots_df.empty:
     pivot = slots_df.pivot_table(
         index="court_name", columns="block_time", values="status", aggfunc="first"
     )
-    pivot_num = pivot.applymap(lambda x: status_to_num.get(x, 0) if pd.notna(x) else 0)
+    pivot_num = pivot.map(lambda x: status_to_num.get(x, 0) if pd.notna(x) else 0)
 
     fig = go.Figure(data=go.Heatmap(
         z=pivot_num.values,
