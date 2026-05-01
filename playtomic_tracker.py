@@ -174,22 +174,22 @@ def update_slot_history(
     """
     Diff current API snapshot against previous state and return updated history.
 
-    Core logic for each 30-min block:
-      - Block IN API response → available (update last_seen_available)
-      - Block NOT in response, never seen → booked (was booked before first poll)
-      - Block NOT in response, was seen before → need the pre-removal check:
-            The platform removes slots from availability a few minutes before
-            their start time even if nobody booked them. So we can't blindly
-            call every disappearing slot "booked".
+    Two live statuses:
+      available     — slot is in the API response right now (not yet booked)
+      booked        — slot is NOT in the API response
 
-    Pre-removal window rule:
-      If a slot disappears AND we last saw it available within
-      PRE_REMOVAL_WINDOW_MINUTES of its start time, treat it as went_unbooked.
-      If it disappeared much earlier (well before the window), someone booked it.
+    One finalised status:
+      went_unbooked — slot was available, then disappeared within
+                      PRE_REMOVAL_WINDOW_MINUTES of its start time,
+                      meaning the platform aged it out rather than
+                      someone booking it
 
-    Finalisation:
-      Once a block's end time has passed, lock its status permanently.
-      Any block still "available" at that point → went_unbooked.
+    Rule: if a slot is not in the response, it is booked — UNLESS it was
+    previously available and disappeared within the grace window, in which
+    case it went unbooked.
+
+    There is no unknown state. Every slot is either available or booked
+    from the very first poll that covers it.
     """
     full_day   = generate_full_day_blocks(target_date)
     date_str   = target_date.strftime("%Y-%m-%d")
@@ -211,11 +211,8 @@ def update_slot_history(
             ).replace(tzinfo=AEST)
             is_past = now >= block_dt + timedelta(minutes=BLOCK_MINUTES)
 
-            # How many minutes until this slot starts (negative = already started)
-            minutes_until_start = (block_dt - now).total_seconds() / 60
-
             prev = prev_court.get(block_time_str, {
-                "status":               "unknown",
+                "status":               "booked",   # default: not seen = booked
                 "first_seen_available": None,
                 "last_seen_available":  None,
                 "finalised":            False,
@@ -226,54 +223,43 @@ def update_slot_history(
                 updated[court_id][block_time_str] = prev
                 continue
 
-            h = dict(prev)  # copy
+            h = dict(prev)
 
             if block_time_str in available_blocks:
-                # ── Slot is showing as available right now ──
+                # ── In API response → available ──
                 if h["first_seen_available"] is None:
                     h["first_seen_available"] = now_iso
                 h["last_seen_available"] = now_iso
                 h["status"] = "available"
 
             else:
-                # ── Slot has disappeared from the API response ──
+                # ── Not in API response → booked, unless grace window applies ──
                 last_seen_str = h.get("last_seen_available")
 
-                if last_seen_str is None:
-                    # Never seen as available at all → was booked before our
-                    # first poll. Mark booked only if we're past the pre-removal
-                    # window (otherwise it might just not have appeared yet).
-                    if minutes_until_start < -PRE_REMOVAL_WINDOW_MINUTES:
-                        h["status"] = "booked"
-                    # else: leave as unknown — too early to call it either way
-
-                else:
-                    # We have seen this slot as available before.
-                    # Now check: when did we last see it, relative to its start?
+                if last_seen_str is not None:
+                    # Was available in a previous poll — check grace window.
+                    # If it disappeared within PRE_REMOVAL_WINDOW_MINUTES of
+                    # start time, the platform aged it out → went_unbooked.
+                    # If it disappeared earlier, someone booked it → booked.
                     last_seen_dt = datetime.fromisoformat(last_seen_str)
                     minutes_from_last_seen_to_start = (
                         block_dt - last_seen_dt
                     ).total_seconds() / 60
 
                     if minutes_from_last_seen_to_start <= PRE_REMOVAL_WINDOW_MINUTES:
-                        # Last seen within the pre-removal window of the slot start.
-                        # The platform almost certainly just aged it out —
-                        # nobody booked it. Mark as went_unbooked.
                         h["status"] = "went_unbooked"
                     else:
-                        # Last seen well before the pre-removal window.
-                        # The gap is too large to be natural age-out — someone
-                        # booked it. Mark as booked.
                         h["status"] = "booked"
+                else:
+                    # Never seen as available → booked
+                    h["status"] = "booked"
 
-            # ── Finalise: lock status once the slot's end time has passed ──
+            # ── Finalise once the slot's end time has passed ──
             if is_past and not h["finalised"]:
-                # Any slot still "available" or "unknown" after it ended →
-                # we never caught a clear signal either way; treat as went_unbooked
-                # since the slot clearly wasn't booked if the platform was still
-                # showing it right up until start time.
-                if h["status"] in ("available", "unknown"):
+                if h["status"] == "available":
+                    # Still showing as available after end time → went unbooked
                     h["status"] = "went_unbooked"
+                # booked stays booked, went_unbooked stays went_unbooked
                 h["finalised"] = True
 
             updated[court_id][block_time_str] = h
