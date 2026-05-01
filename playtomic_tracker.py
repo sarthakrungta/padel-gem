@@ -156,7 +156,7 @@ def build_slot_history_from_db(target_date: date) -> dict:
     history: dict[str, dict] = {}
     for row in rows:
         cid = row["court_id"]
-        bt  = row["block_time"].strftime("%H:%M")  # time object → string
+        bt  = row["block_time"][:5] if isinstance(row["block_time"], str) else row["block_time"].strftime("%H:%M")
         history.setdefault(cid, {})[bt] = {
             "status":               row["status"],
             "first_seen_available": row["first_seen_available"].isoformat() if row["first_seen_available"] else None,
