@@ -1,99 +1,100 @@
-# Deployment Guide — Padel Court Tracker
-=========================================
+# Deployment Guide — Padel Court Tracker (SQLite + GitHub Gist)
+================================================================
 
 ## Architecture
 
 ```
-GitHub repo (your code)
-    ↓
-Railway.app  ──── runs playtomic_tracker.py --loop every 5 min
-    ↓  writes to
-Supabase ──── PostgreSQL database (free tier)
-    ↑  reads from
-Streamlit Cloud ──── public dashboard URL (free)
+Railway (poller)
+  - runs playtomic_tracker.py --loop every 5 min
+  - stores data in SQLite on Railway's persistent disk
+  - after each poll, pushes JSON export to a secret GitHub Gist
+                        |
+                        v
+            GitHub Gist (JSON file, ~100KB)
+                        |
+                        v
+Streamlit Community Cloud (dashboard)
+  - fetches Gist over HTTPS every 2 min
+  - renders charts and tables
+  - shareable public URL, no login needed
 ```
+
+No external database. No DNS issues. Just SQLite + a Gist.
 
 ---
 
-## Step 1 — Supabase (database)
+## Step 1 — Create a GitHub Personal Access Token
 
-1. Go to https://supabase.com and create a free account
-2. Click "New Project", give it a name (e.g. "padel-tracker"), pick a region
-   closest to Australia (ap-southeast-2 Sydney)
-3. Once created, go to: Project Settings → Database → Connection string
-4. Select **URI** mode and copy the string. It looks like:
-   `postgresql://postgres:[YOUR-PASSWORD]@db.xxxx.supabase.co:5432/postgres`
-5. Keep this safe — you'll need it in steps 2 and 3.
+1. Go to https://github.com/settings/tokens
+2. Click "Generate new token (classic)"
+3. Give it a name e.g. "padel-tracker"
+4. Tick ONLY the "gist" scope
+5. Click "Generate token" and copy it — you won't see it again
 
-**Create the tables (one-time setup):**
+---
+
+## Step 2 — Create the Gist (run once on your laptop)
+
 ```bash
-# On your laptop, in the project folder:
+cd your-project-folder
 pip install -r requirements.txt
-export DATABASE_URL="postgresql://postgres:..."   # paste your URI
-python db.py --init
+
+export GITHUB_TOKEN="ghp_your_token_here"
+python db.py --init          # creates local SQLite tables
+python db.py --create-gist   # creates the secret Gist
 ```
-You should see: "Schema initialised (or already exists)."
+
+You'll see output like:
+```
+Gist created!
+  GIST_ID      = abc123def456
+  View URL     = https://gist.github.com/abc123def456
+
+Set these in Railway env vars:
+  GIST_ID      = abc123def456
+  GITHUB_TOKEN = ghp_your_token_here
+
+Set this in Streamlit secrets:
+  GIST_RAW_URL = "https://gist.githubusercontent.com/YOU/abc123def456/raw/padel_tracker_data.json"
+```
+
+Save all three values.
 
 ---
 
-## Step 2 — Railway (poller)
+## Step 3 — Deploy to Railway (poller)
 
-1. Go to https://railway.app and sign up (GitHub login is easiest)
-2. Click "New Project" → "Deploy from GitHub repo"
-3. Connect your GitHub account and select the repo with these files
-4. Railway will detect the `railway.toml` and start deploying
-5. Once deployed, go to your service → **Variables** tab
-6. Add one environment variable:
+1. Push all files to a GitHub repo
+2. Go to https://railway.app → New Project → Deploy from GitHub repo
+3. Select your repo
+4. Go to your service → Variables tab → add:
    ```
-   DATABASE_URL = postgresql://postgres:...   (your Supabase URI from Step 1)
+   GITHUB_TOKEN = ghp_your_token_here
+   GIST_ID      = abc123def456
    ```
-7. Railway will restart the service. Check the **Logs** tab — you should see:
-   ```
-   Continuous mode — polling every 300s...
-   [2026-05-01 08:00:00 AEST] ── Poll starting for 2026-05-01
-     Fetching API for 2026-05-01 …
-     Courts found: 3
-     ✓ DB updated. Poll complete.
-   ```
+5. Railway will auto-run: `python playtomic_tracker.py --loop`
+   (as configured in railway.toml)
+6. Check Logs tab — you should see polls firing every 5 minutes
 
-**Cost:** Free tier gives 500 hours/month. This service runs 24/7 = ~720h/month.
-Upgrade to Hobby plan ($5/month) to run without sleep.
+Note: Railway Hobby plan is $5/month for always-on service.
+Free tier sleeps after inactivity which will break the polling loop.
 
 ---
 
-## Step 3 — Streamlit Community Cloud (dashboard)
+## Step 4 — Deploy to Streamlit (dashboard)
 
-1. Push all files to a GitHub repo (public or private)
-2. Go to https://share.streamlit.io and sign in with GitHub
-3. Click "New app"
-4. Select your repo, branch (main), and set:
-   - Main file path: `dashboard.py`
-5. Click "Advanced settings" → Secrets
-6. Add your database URL in TOML format:
+1. Go to https://share.streamlit.io → New app
+2. Select your GitHub repo, branch: main, file: dashboard.py
+3. Click "Advanced settings" → Secrets, paste:
    ```toml
-   DATABASE_URL = "postgresql://postgres:..."
+   GIST_RAW_URL = "https://gist.githubusercontent.com/YOU/abc123def456/raw/padel_tracker_data.json"
    ```
-7. Click "Deploy"
+4. Click Deploy
 
 Your dashboard will be live at a URL like:
-`https://yourname-padel-tracker-dashboard-abc123.streamlit.app`
+  https://yourname-padel-tracker-dashboard-xyz.streamlit.app
 
-Share this link with anyone — no login needed.
-
----
-
-## Step 4 — Update court names (optional but recommended)
-
-In `dashboard.py`, find the `COURT_LABELS` dict near the top and
-replace the UUIDs with friendly names:
-
-```python
-COURT_LABELS = {
-    "4a5fb5fe-139f-40b0-85e7-634c705d7284": "Court 1",
-    "6a01f11b-3f57-4e81-bf0d-c1359d82caef": "Court 2",
-    "e60b3a03-4c04-4021-a531-626d7d973135": "Court 3",
-}
-```
+Share that link with anyone — no login required.
 
 ---
 
@@ -101,11 +102,11 @@ COURT_LABELS = {
 
 ```
 padel_tracker/
-├── db.py                  # database read/write layer (Supabase)
-├── playtomic_tracker.py   # poller — runs on Railway
+├── db.py                  # SQLite layer + Gist export
+├── playtomic_tracker.py   # poller (runs on Railway)
 ├── dashboard.py           # Streamlit dashboard
-├── requirements.txt       # Python dependencies
-├── railway.toml           # Railway deployment config
+├── requirements.txt       # Python deps (no psycopg2 needed)
+├── railway.toml           # Railway config
 └── DEPLOY.md              # this file
 ```
 
@@ -115,8 +116,7 @@ padel_tracker/
 
 | Symptom | Fix |
 |---------|-----|
-| `EnvironmentError: DATABASE_URL not set` | Set the env var in Railway / Streamlit secrets |
-| `SSL error` on DB connect | Make sure URI has `?sslmode=require` at the end |
-| Dashboard shows "No data yet" | Check Railway logs — poller might be failing |
-| Slots all show "unknown" | Poller ran but `db.py --init` was never run |
-| Wrong court names | Update `COURT_LABELS` in `dashboard.py` |
+| Dashboard shows "No data yet" | Check Railway logs — poller might be crashing |
+| Gist export fails | Check GITHUB_TOKEN and GIST_ID are set in Railway vars |
+| Dashboard can't load Gist | Check GIST_RAW_URL in Streamlit secrets — must be the /raw/ URL |
+| SQLite errors on Railway | Add DB_PATH=/data/padel.db to Railway vars and enable persistent disk |

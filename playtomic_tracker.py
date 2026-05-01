@@ -1,16 +1,21 @@
 """
 playtomic_tracker.py — Court availability poller (cloud version)
 =================================================================
-Polls the Playtomic API, converts UTC→AEST, expands slots into 30-min blocks,
-diffs against previous snapshots, and writes results to Supabase (PostgreSQL).
+Polls the Playtomic API, converts UTC->AEST, expands slots into 30-min blocks,
+diffs against previous snapshots, writes to local SQLite, then pushes a JSON
+export to a GitHub Gist for the Streamlit dashboard to consume.
 
 Usage:
   python playtomic_tracker.py            # one poll
   python playtomic_tracker.py --loop     # poll every POLL_INTERVAL_SECONDS
-  python db.py --init                    # run once on first deploy to create tables
 
-Environment variables required:
-  DATABASE_URL   — Supabase/PostgreSQL connection URI
+One-time setup:
+  python db.py --init                    # create SQLite tables
+  python db.py --create-gist             # create the GitHub Gist (needs GITHUB_TOKEN)
+
+Environment variables (set in Railway):
+  GITHUB_TOKEN   — GitHub PAT with "gist" scope
+  GIST_ID        — Gist ID printed by --create-gist
 """
 
 import requests
@@ -294,17 +299,20 @@ def run_poll():
         for cid, blocks in court_blocks.items():
             print(f"    {cid[:8]}…: {len(blocks)} available blocks")
 
-        # 3. Load previous state from DB
+        # 3. Load previous state from SQLite
         prev_history = build_slot_history_from_db(target_date)
 
         # 4. Diff
         updated_history = update_slot_history(target_date, court_blocks, prev_history)
 
-        # 5. Write to DB
+        # 5. Write to SQLite
         db.upsert_slot_states(updated_history, target_date)
         db.record_poll(target_date, success=True)
 
-        print(f"  ✓ DB updated. Poll complete.")
+        # 6. Push export to GitHub Gist so Streamlit dashboard can read it
+        db.export_gist()
+
+        print(f"  Poll complete.")
 
     except Exception as e:
         print(f"  ✗ Poll failed: {e}")

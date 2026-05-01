@@ -1,250 +1,258 @@
 """
-db.py — Database layer using Supabase (PostgreSQL)
-====================================================
-Replaces the local JSON snapshot files with a proper database.
-All reads/writes go through this module.
+db.py — SQLite database layer (no external DB needed)
+======================================================
+Stores all slot state in a local SQLite file on Railway's persistent disk.
+After each poll the tracker calls export_gist() to push a JSON summary to a
+secret GitHub Gist, which the Streamlit dashboard fetches over HTTPS.
 
-Setup:
-  1. Create a free project at https://supabase.com
-  2. Go to Project Settings → Database → Connection string (URI mode)
-  3. Set the DATABASE_URL environment variable to that URI
-  4. Run: python db.py --init   to create the tables on first use
+Environment variables required:
+  GITHUB_TOKEN   — Personal Access Token with "gist" scope
+  GIST_ID        — ID of the secret gist to update (create once, reuse forever)
 
-Tables:
-  polls          — one row per API poll attempt
-  slot_states    — one row per (date, court_id, block_time), updated each poll
+Optional:
+  DB_PATH        — path to SQLite file (default: ./tracker_data/padel.db)
+
+One-time setup on your laptop:
+  1. Create a GitHub PAT at https://github.com/settings/tokens
+     -> "Generate new token (classic)" -> tick only "gist" scope
+  2. Run:  python db.py --create-gist
+     This creates the secret gist and prints its ID.
+  3. Set GITHUB_TOKEN and GIST_ID as env vars in Railway.
 """
 
 import os
+import json
+import sqlite3
 import argparse
-import psycopg2
-import psycopg2.extras
+import requests
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
+from contextlib import contextmanager
 
-AEST = ZoneInfo("Australia/Sydney")
+AEST    = ZoneInfo("Australia/Sydney")
+DB_PATH = os.environ.get("DB_PATH", "./tracker_data/padel.db")
 
-# ── Read connection string from environment variable
-# Set this in Railway as an environment variable (Railway auto-sets it if you
-# attach a Postgres plugin, OR paste your Supabase URI manually).
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if not DATABASE_URL:
-    raise EnvironmentError(
-        "DATABASE_URL environment variable not set.\n"
-        "Get it from: Supabase → Project Settings → Database → URI"
-    )
+GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
+GIST_ID       = os.environ.get("GIST_ID", "")
+GIST_FILENAME = "padel_tracker_data.json"
 
 
+def ensure_db_dir():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+
+@contextmanager
 def get_conn():
-    """Return a new psycopg2 connection. Call .close() when done."""
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SCHEMA INITIALISATION
-# ─────────────────────────────────────────────────────────────────────────────
-
-SCHEMA_SQL = """
--- One row per poll execution
-CREATE TABLE IF NOT EXISTS polls (
-    id          SERIAL PRIMARY KEY,
-    polled_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    query_date  DATE        NOT NULL,   -- AEST date we queried
-    success     BOOLEAN     NOT NULL,
-    error_msg   TEXT
-);
-
--- One row per (query_date, court_id, block_time).
--- Updated (upserted) on every poll.
-CREATE TABLE IF NOT EXISTS slot_states (
-    id                    SERIAL PRIMARY KEY,
-    query_date            DATE        NOT NULL,
-    court_id              TEXT        NOT NULL,
-    block_time            TIME        NOT NULL,   -- AEST 30-min block start e.g. 06:00
-    status                TEXT        NOT NULL,   -- available | booked | went_unbooked
-    first_seen_available  TIMESTAMPTZ,
-    last_seen_available   TIMESTAMPTZ,
-    finalised             BOOLEAN     NOT NULL DEFAULT FALSE,
-    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-    UNIQUE (query_date, court_id, block_time)
-);
-
--- Index for fast dashboard queries
-CREATE INDEX IF NOT EXISTS idx_slot_states_date  ON slot_states (query_date);
-CREATE INDEX IF NOT EXISTS idx_slot_states_court ON slot_states (court_id);
-"""
+    ensure_db_dir()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_schema():
-    """Create tables if they don't exist. Safe to run multiple times."""
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(SCHEMA_SQL)
-        conn.commit()
-    print("Schema initialised (or already exists).")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS polls (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                polled_at  TEXT NOT NULL,
+                query_date TEXT NOT NULL,
+                success    INTEGER NOT NULL,
+                error_msg  TEXT
+            );
 
+            CREATE TABLE IF NOT EXISTS slot_states (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_date           TEXT NOT NULL,
+                court_id             TEXT NOT NULL,
+                block_time           TEXT NOT NULL,
+                status               TEXT NOT NULL,
+                first_seen_available TEXT,
+                last_seen_available  TEXT,
+                finalised            INTEGER NOT NULL DEFAULT 0,
+                updated_at           TEXT NOT NULL,
+                UNIQUE (query_date, court_id, block_time)
+            );
 
-# ─────────────────────────────────────────────────────────────────────────────
-# WRITE OPERATIONS
-# ─────────────────────────────────────────────────────────────────────────────
+            CREATE INDEX IF NOT EXISTS idx_ss_date  ON slot_states (query_date);
+            CREATE INDEX IF NOT EXISTS idx_ss_court ON slot_states (court_id);
+        """)
+    print(f"Schema ready at {DB_PATH}")
+
 
 def record_poll(query_date: date, success: bool, error_msg: str = None):
-    """Insert a row into the polls audit table."""
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO polls (query_date, success, error_msg) VALUES (%s, %s, %s)",
-                (query_date, success, error_msg)
-            )
-        conn.commit()
+        conn.execute(
+            "INSERT INTO polls (polled_at, query_date, success, error_msg) VALUES (?,?,?,?)",
+            (datetime.now(tz=AEST).isoformat(), str(query_date), int(success), error_msg)
+        )
 
 
 def upsert_slot_states(slot_history_for_date: dict, query_date: date):
-    """
-    Upsert all slot state rows for a given date.
-
-    slot_history_for_date shape (same as the inner dict from tracker logic):
-    {
-      "court_id_1": {
-        "06:00": {
-          "status": "available",
-          "first_seen_available": "2026-05-01T06:05:00+10:00",
-          "last_seen_available":  "2026-05-01T07:05:00+10:00",
-          "finalised": False
-        },
-        ...
-      }
-    }
-    """
+    now = datetime.now(tz=AEST).isoformat()
     rows = []
-    now = datetime.now(tz=AEST)
-
     for court_id, blocks in slot_history_for_date.items():
         for block_time_str, h in blocks.items():
             rows.append((
-                query_date,
+                str(query_date),
                 court_id,
-                block_time_str,          # e.g. "06:00"
+                block_time_str,
                 h.get("status", "unknown"),
                 h.get("first_seen_available"),
                 h.get("last_seen_available"),
-                h.get("finalised", False),
+                int(h.get("finalised", False)),
                 now,
             ))
+    with get_conn() as conn:
+        conn.executemany("""
+            INSERT INTO slot_states
+                (query_date, court_id, block_time, status,
+                 first_seen_available, last_seen_available, finalised, updated_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT (query_date, court_id, block_time) DO UPDATE SET
+                status               = excluded.status,
+                first_seen_available = COALESCE(slot_states.first_seen_available,
+                                                excluded.first_seen_available),
+                last_seen_available  = excluded.last_seen_available,
+                finalised            = excluded.finalised,
+                updated_at           = excluded.updated_at
+        """, rows)
 
-    if not rows:
+
+def get_slot_states_for_date(query_date: date) -> list:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM slot_states WHERE query_date=? ORDER BY court_id, block_time",
+            (str(query_date),)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_available_dates() -> list:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT query_date FROM slot_states ORDER BY query_date DESC"
+        ).fetchall()
+    return [r["query_date"] for r in rows]
+
+
+def get_utilisation_by_date() -> list:
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                query_date,
+                SUM(status = 'booked')        AS booked_blocks,
+                SUM(status = 'went_unbooked') AS unbooked_blocks,
+                SUM(finalised = 1)             AS finalised_blocks,
+                COUNT(DISTINCT court_id)       AS num_courts
+            FROM slot_states
+            GROUP BY query_date
+            ORDER BY query_date DESC
+        """).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        f = d["finalised_blocks"] or 0
+        d["utilisation_pct"] = round(d["booked_blocks"] / f * 100, 1) if f > 0 else None
+        result.append(d)
+    return result
+
+
+def get_recent_polls(limit: int = 10) -> list:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM polls ORDER BY polled_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def build_export_payload() -> dict:
+    """Build the JSON payload the Streamlit dashboard will fetch."""
+    dates = get_available_dates()[:30]
+    slots_by_date = {}
+    for d in dates:
+        slots_by_date[d] = get_slot_states_for_date(date.fromisoformat(d))
+    return {
+        "exported_at":       datetime.now(tz=AEST).isoformat(),
+        "available_dates":   dates,
+        "utilisation_trend": get_utilisation_by_date()[:30],
+        "recent_polls":      get_recent_polls(10),
+        "slots_by_date":     slots_by_date,
+    }
+
+
+def export_gist():
+    """Push the latest data to the GitHub Gist. Skips if env vars not set."""
+    if not GITHUB_TOKEN or not GIST_ID:
+        print("  [Gist] GITHUB_TOKEN or GIST_ID not set — skipping export.")
         return
-
-    upsert_sql = """
-        INSERT INTO slot_states
-            (query_date, court_id, block_time, status,
-             first_seen_available, last_seen_available, finalised, updated_at)
-        VALUES %s
-        ON CONFLICT (query_date, court_id, block_time)
-        DO UPDATE SET
-            status               = EXCLUDED.status,
-            first_seen_available = COALESCE(slot_states.first_seen_available, EXCLUDED.first_seen_available),
-            last_seen_available  = EXCLUDED.last_seen_available,
-            finalised            = EXCLUDED.finalised,
-            updated_at           = EXCLUDED.updated_at
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_values(cur, upsert_sql, rows)
-        conn.commit()
+    content = json.dumps(build_export_payload(), indent=2, default=str)
+    resp = requests.patch(
+        f"https://api.github.com/gists/{GIST_ID}",
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        },
+        json={"files": {GIST_FILENAME: {"content": content}}},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    print(f"  [Gist] Exported {len(content)//1024}KB to gist/{GIST_ID}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# READ OPERATIONS  (used by dashboard.py)
-# ─────────────────────────────────────────────────────────────────────────────
+def create_gist() -> str:
+    """Create a new secret GitHub Gist. Run once: python db.py --create-gist"""
+    if not GITHUB_TOKEN:
+        raise EnvironmentError("Set GITHUB_TOKEN env var first.")
+    resp = requests.post(
+        "https://api.github.com/gists",
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        },
+        json={
+            "description": "Padel court tracker data (auto-updated)",
+            "public": False,
+            "files": {GIST_FILENAME: {"content": json.dumps({"status": "initialised"})}},
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data     = resp.json()
+    gist_id  = data["id"]
+    username = data["owner"]["login"]
+    raw_url  = f"https://gist.githubusercontent.com/{username}/{gist_id}/raw/{GIST_FILENAME}"
 
-def get_slot_states_for_date(query_date: date) -> list[dict]:
-    """
-    Return all slot state rows for a given date.
-    Each row is a dict with keys matching the slot_states columns.
-    """
-    sql = """
-        SELECT query_date, court_id, block_time, status,
-               first_seen_available, last_seen_available, finalised, updated_at
-        FROM slot_states
-        WHERE query_date = %s
-        ORDER BY court_id, block_time
-    """
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (query_date,))
-            return [dict(r) for r in cur.fetchall()]
+    print(f"\nGist created!")
+    print(f"  GIST_ID      = {gist_id}")
+    print(f"  View URL     = {data['html_url']}")
+    print(f"\nSet these in Railway env vars:")
+    print(f"  GIST_ID      = {gist_id}")
+    print(f"  GITHUB_TOKEN = <your token>")
+    print(f"\nSet this in Streamlit secrets:")
+    print(f"  GIST_RAW_URL = \"{raw_url}\"")
+    return gist_id
 
-
-def get_available_dates() -> list[date]:
-    """Return all dates that have slot data, newest first."""
-    sql = "SELECT DISTINCT query_date FROM slot_states ORDER BY query_date DESC"
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            return [row[0] for row in cur.fetchall()]
-
-
-def get_utilisation_by_date() -> list[dict]:
-    """
-    Aggregate utilisation stats per date across all courts.
-    Only counts finalised slots (booked + went_unbooked).
-    Returns newest-first list of dicts.
-    """
-    sql = """
-        SELECT
-            query_date,
-            COUNT(*) FILTER (WHERE status = 'booked')        AS booked_blocks,
-            COUNT(*) FILTER (WHERE status = 'went_unbooked') AS unbooked_blocks,
-            COUNT(*) FILTER (WHERE finalised = TRUE)          AS finalised_blocks,
-            COUNT(DISTINCT court_id)                          AS num_courts
-        FROM slot_states
-        GROUP BY query_date
-        ORDER BY query_date DESC
-    """
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql)
-            rows = [dict(r) for r in cur.fetchall()]
-
-    for row in rows:
-        f = row["finalised_blocks"]
-        row["utilisation_pct"] = round(
-            row["booked_blocks"] / f * 100, 1
-        ) if f > 0 else None
-
-    return rows
-
-
-def get_court_ids() -> list[str]:
-    """Return all known court IDs."""
-    sql = "SELECT DISTINCT court_id FROM slot_states ORDER BY court_id"
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            return [r[0] for r in cur.fetchall()]
-
-
-def get_recent_polls(limit: int = 20) -> list[dict]:
-    """Return the most recent poll records."""
-    sql = """
-        SELECT polled_at, query_date, success, error_msg
-        FROM polls ORDER BY polled_at DESC LIMIT %s
-    """
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (limit,))
-            return [dict(r) for r in cur.fetchall()]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI helper
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--init", action="store_true", help="Create DB tables")
+    parser.add_argument("--init",        action="store_true", help="Create SQLite tables")
+    parser.add_argument("--create-gist", action="store_true", help="Create GitHub Gist (run once)")
+    parser.add_argument("--export-gist", action="store_true", help="Push current data to Gist now")
     args = parser.parse_args()
+
     if args.init:
         init_schema()
+    elif args.create_gist:
+        create_gist()
+    elif args.export_gist:
+        export_gist()
+    else:
+        parser.print_help()
