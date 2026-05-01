@@ -176,19 +176,26 @@ trend_df   = pd.DataFrame(trend_rows) if trend_rows else pd.DataFrame()
 # ── Top metrics ──────────────────────────────────────────────────────────────
 
 if not slots_df.empty:
-    finalised = slots_df[slots_df["finalised"].astype(bool)]
-    total_booked   = (finalised["status"] == "booked").sum()
-    total_unbooked = (finalised["status"] == "went_unbooked").sum()
-    total_finalised = total_booked + total_unbooked
-    util_pct = round(total_booked / total_finalised * 100, 1) if total_finalised > 0 else 0
-    n_courts = slots_df["court_id"].nunique()
+    finalised    = slots_df[slots_df["finalised"].astype(bool)]
+    still_open   = slots_df[slots_df["status"] == "available"]
 
-    c1, c2, c3, c4 = st.columns(4)
+    total_booked      = (finalised["status"] == "booked").sum()
+    total_unbooked    = (finalised["status"] == "went_unbooked").sum()
+    total_still_avail = len(still_open)
+    total_finalised   = total_booked + total_unbooked
+    n_courts          = slots_df["court_id"].nunique()
+
+    # Utilisation = booked / (booked + went_unbooked), only over finalised slots
+    # so future/current available slots don't deflate the number mid-day
+    util_pct = round(total_booked / total_finalised * 100, 1) if total_finalised > 0 else 0
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     for col, val, label in [
-        (c1, f"{util_pct}%",                       "Overall utilisation"),
-        (c2, f"{round(total_booked*30/60,1)}h",    "Total booked hours"),
-        (c3, f"{round(total_unbooked*30/60,1)}h",  "Total unbooked hours"),
-        (c4, str(n_courts),                         "Courts tracked"),
+        (c1, f"{util_pct}%",                            "Utilisation (finalised)"),
+        (c2, f"{round(total_booked*30/60,1)}h",         "Booked hours"),
+        (c3, f"{round(total_unbooked*30/60,1)}h",       "Went unbooked"),
+        (c4, f"{round(total_still_avail*30/60,1)}h",    "Still available"),
+        (c5, str(n_courts),                               "Courts tracked"),
     ]:
         with col:
             st.markdown(f"""<div class="metric-card">
@@ -201,10 +208,10 @@ st.markdown("---")
 # ── Court timeline heatmap ────────────────────────────────────────────────────
 
 st.markdown("### Court Timeline")
-st.caption("Each cell = one 30-min block  ·  🔴 Booked  🟢 Went unbooked  🔵 Still available  ⬛ Unknown")
+st.caption("Each cell = one 30-min block  ·  🔴 Booked  🟢 Went unbooked  🔵 Still available (future)")
 
 if not slots_df.empty:
-    status_to_num = {"booked": 1, "went_unbooked": 2, "available": 3, "unknown": 0}
+    status_to_num = {"booked": 0, "went_unbooked": 1, "available": 2}
     pivot = slots_df.pivot_table(
         index="court_name", columns="block_time", values="status", aggfunc="first"
     )
@@ -215,10 +222,9 @@ if not slots_df.empty:
         x=pivot_num.columns.tolist(),
         y=pivot_num.index.tolist(),
         colorscale=[
-            [0,    "#374151"],
-            [0.33, "#ff4d6d"],
-            [0.66, "#00ff9d"],
-            [1.0,  "#38bdf8"],
+            [0,   "#ff4d6d"],   # booked → red
+            [0.5, "#00ff9d"],   # went_unbooked → green
+            [1.0, "#38bdf8"],   # available (future) → blue
         ],
         showscale=False,
         hovertemplate="<b>%{y}</b><br>%{x}<br>%{text}<extra></extra>",
