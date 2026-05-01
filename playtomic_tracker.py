@@ -159,8 +159,9 @@ def build_slot_history_from_db(target_date: date) -> dict:
         bt  = row["block_time"][:5] if isinstance(row["block_time"], str) else row["block_time"].strftime("%H:%M")
         history.setdefault(cid, {})[bt] = {
             "status":               row["status"],
-            "first_seen_available": row["first_seen_available"].isoformat() if row["first_seen_available"] else None,
-            "last_seen_available":  row["last_seen_available"].isoformat()  if row["last_seen_available"]  else None,
+            # SQLite returns timestamps as plain strings already — no .isoformat() needed
+            "first_seen_available": row["first_seen_available"] if row["first_seen_available"] else None,
+            "last_seen_available":  row["last_seen_available"]  if row["last_seen_available"]  else None,
             "finalised":            row["finalised"],
         }
     return history
