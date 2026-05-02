@@ -1,20 +1,12 @@
 """
-dashboard.py — Padel Court Utilisation Dashboard
-==================================================
-Reads data from a GitHub Gist that the poller updates after every poll.
-No database connection needed — just an HTTPS fetch.
-
-Deploy to Streamlit Community Cloud. Set one secret:
-  GIST_RAW_URL = "https://gist.githubusercontent.com/USER/GIST_ID/raw/padel_tracker_data.json"
-  (printed by: python db.py --create-gist)
-
-Run locally:
-  export GIST_RAW_URL="https://..."
-  streamlit run dashboard.py
+dashboard.py — Multi-club Padel Court Utilisation Dashboard
+============================================================
+Reads from GitHub Gist. Club selector in sidebar filters all views.
 """
 
 import os
 import json
+import requests
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -24,16 +16,27 @@ from zoneinfo import ZoneInfo
 
 AEST = ZoneInfo("Australia/Sydney")
 
-GIST_RAW_URL = os.environ.get("GIST_RAW_URL", st.secrets.get("GIST_RAW_URL", ""))
+GIST_RAW_URL = os.environ.get("GIST_RAW_URL", "") or st.secrets.get("GIST_RAW_URL", "")
 
-COURT_LABELS = {
-    "4a5fb5fe-139f-40b0-85e7-634c705d7284": "Court 1",
-    "6a01f11b-3f57-4e81-bf0d-c1359d82caef": "Court 2",
-    "e60b3a03-4c04-4021-a531-626d7d973135": "Court 3",
+# Club display names — must match keys in CLUBS dict in the tracker
+CLUB_DISPLAY_NAMES = {
+    "south_east_padel":    "South East Padel",
+    "game4padel_richmond": "Game4Padel Richmond",
 }
 
-def court_name(cid: str) -> str:
-    return COURT_LABELS.get(cid, cid[:8] + "…")
+# Court short names per club
+COURT_LABELS = {
+    "south_east_padel": {
+        "4a5fb5fe-139f-40b0-85e7-634c705d7284": "Court 1",
+        "6a01f11b-3f57-4e81-bf0d-c1359d82caef": "Court 2",
+        "e60b3a03-4c04-4021-a531-626d7d973135": "Court 3",
+    },
+    "game4padel_richmond": {},  # will fall back to truncated UUID until courts are observed
+}
+
+def court_name(club_id: str, court_id: str) -> str:
+    label = COURT_LABELS.get(club_id, {}).get(court_id)
+    return label if label else court_id[:8] + "…"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG + STYLING
@@ -61,15 +64,13 @@ h1, h2, h3 { font-family: 'Syne', sans-serif !important; letter-spacing: -0.02em
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA LOADING — fetch from Gist, cache 2 minutes
+# DATA LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=120)
 def load_data() -> dict:
     if not GIST_RAW_URL:
         return {}
-    import requests, json
-
     resp = requests.get(
         GIST_RAW_URL,
         headers={
@@ -80,37 +81,21 @@ def load_data() -> dict:
         timeout=15,
     )
     resp.raise_for_status()
-
-    # If GitHub returned HTML instead of JSON (redirect/login page)
     if "html" in resp.headers.get("Content-Type", ""):
-        st.error(
-            "GitHub returned an HTML page instead of JSON. "
-            "Check that GIST_RAW_URL uses the permanent /raw/ format "
-            "without a commit hash."
-        )
-        st.code(f"""URL: {GIST_RAW_URL}
-Content-Type: {resp.headers.get('Content-Type')}
-Preview: {resp.text[:300]}""")
+        st.error("GitHub returned HTML instead of JSON. Check GIST_RAW_URL.")
         return {}
-
     try:
         return resp.json()
     except json.JSONDecodeError:
-        # Gist initialised but poller has not run yet
-        st.info(
-            f"Gist found but no tracking data yet — Railway poller may not have run.\n\n"
-            f"Raw content: `{resp.text[:300]}`"
-        )
+        st.info("Gist found but no tracking data yet — poller may not have run.")
         return {}
 
-
-def slots_to_df(slots: list) -> pd.DataFrame:
+def slots_to_df(slots: list, club_id: str) -> pd.DataFrame:
     if not slots:
         return pd.DataFrame()
     df = pd.DataFrame(slots)
-    df["court_name"] = df["court_id"].apply(court_name)
+    df["court_name"] = df["court_id"].apply(lambda cid: court_name(club_id, cid))
     return df
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOAD + GUARD
@@ -118,15 +103,16 @@ def slots_to_df(slots: list) -> pd.DataFrame:
 
 data = load_data()
 
-if not data or not data.get("available_dates"):
+if not data or not data.get("clubs"):
     st.title("🎾 Padel Court Analytics")
     if not GIST_RAW_URL:
         st.error("GIST_RAW_URL not configured. Set it in Streamlit secrets.")
     else:
-        st.info("No data yet — the poller hasn't run or the Gist is empty. Check Railway logs.")
+        st.info("No data yet — poller hasn't run or Gist is empty.")
     st.stop()
 
 exported_at = data.get("exported_at", "")
+clubs_data  = data.get("clubs", {})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -142,7 +128,23 @@ with st.sidebar:
             st.caption(f"Last updated: {exported_at}")
 
     st.markdown("---")
-    available_dates = data["available_dates"]
+
+    # ── Club selector
+    available_clubs = list(clubs_data.keys())
+    selected_club = st.selectbox(
+        "Select club",
+        options=available_clubs,
+        format_func=lambda c: CLUB_DISPLAY_NAMES.get(c, c),
+    )
+
+    club_data = clubs_data.get(selected_club, {})
+    available_dates = club_data.get("available_dates", [])
+
+    if not available_dates:
+        st.warning("No data for this club yet.")
+        st.stop()
+
+    # ── Date selector
     selected_date = st.selectbox(
         "Select date",
         options=available_dates,
@@ -153,8 +155,9 @@ with st.sidebar:
     st.markdown("##### Recent polls")
     for p in data.get("recent_polls", [])[:6]:
         icon = "✅" if p.get("success") else "❌"
-        ts = p.get("polled_at", "")[:16].replace("T", " ")
-        st.markdown(f"{icon} `{ts}`")
+        club = CLUB_DISPLAY_NAMES.get(p.get("club_id", ""), p.get("club_id", ""))
+        ts   = p.get("polled_at", "")[:16].replace("T", " ")
+        st.markdown(f"{icon} `{ts}` {club}")
 
     st.markdown("---")
     st.caption("Auto-refreshes every 2 min · Times in AEST")
@@ -163,39 +166,36 @@ with st.sidebar:
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.markdown("# Padel Court Utilisation")
+club_display = CLUB_DISPLAY_NAMES.get(selected_club, selected_club)
+st.markdown(f"# {club_display}")
 date_label = datetime.strptime(selected_date, "%Y-%m-%d").strftime("%A, %d %B %Y")
 st.markdown(f"Showing data for **{date_label}**")
 
-raw_slots = data.get("slots_by_date", {}).get(selected_date, [])
-slots_df  = slots_to_df(raw_slots)
+raw_slots = club_data.get("slots_by_date", {}).get(selected_date, [])
+slots_df  = slots_to_df(raw_slots, selected_club)
 
-trend_rows = data.get("utilisation_trend", [])
+trend_rows = club_data.get("utilisation_trend", [])
 trend_df   = pd.DataFrame(trend_rows) if trend_rows else pd.DataFrame()
 
 # ── Top metrics ──────────────────────────────────────────────────────────────
 
 if not slots_df.empty:
-    finalised    = slots_df[slots_df["finalised"].astype(bool)]
-    still_open   = slots_df[slots_df["status"] == "available"]
-
-    total_booked      = (finalised["status"] == "booked").sum()
-    total_unbooked    = (finalised["status"] == "went_unbooked").sum()
-    total_still_avail = len(still_open)
-    total_finalised   = total_booked + total_unbooked
-    n_courts          = slots_df["court_id"].nunique()
-
-    # Utilisation = booked / (booked + went_unbooked), only over finalised slots
-    # so future/current available slots don't deflate the number mid-day
-    util_pct = round(total_booked / total_finalised * 100, 1) if total_finalised > 0 else 0
+    finalised       = slots_df[slots_df["finalised"].astype(bool)]
+    still_open      = slots_df[slots_df["status"] == "available"]
+    total_booked    = (finalised["status"] == "booked").sum()
+    total_unbooked  = (finalised["status"] == "went_unbooked").sum()
+    total_finalised = total_booked + total_unbooked
+    total_available = len(still_open)
+    n_courts        = slots_df["court_id"].nunique()
+    util_pct        = round(total_booked / total_finalised * 100, 1) if total_finalised > 0 else 0
 
     c1, c2, c3, c4, c5 = st.columns(5)
     for col, val, label in [
-        (c1, f"{util_pct}%",                            "Utilisation (finalised)"),
-        (c2, f"{round(total_booked*30/60,1)}h",         "Booked hours"),
-        (c3, f"{round(total_unbooked*30/60,1)}h",       "Went unbooked"),
-        (c4, f"{round(total_still_avail*30/60,1)}h",    "Still available"),
-        (c5, str(n_courts),                               "Courts tracked"),
+        (c1, f"{util_pct}%",                          "Utilisation (finalised)"),
+        (c2, f"{round(total_booked*30/60,1)}h",       "Booked hours"),
+        (c3, f"{round(total_unbooked*30/60,1)}h",     "Went unbooked"),
+        (c4, f"{round(total_available*30/60,1)}h",    "Still available"),
+        (c5, str(n_courts),                            "Courts tracked"),
     ]:
         with col:
             st.markdown(f"""<div class="metric-card">
@@ -208,7 +208,7 @@ st.markdown("---")
 # ── Court timeline heatmap ────────────────────────────────────────────────────
 
 st.markdown("### Court Timeline")
-st.caption("Each cell = one 30-min block  ·  🔴 Booked  🟢 Went unbooked  🔵 Still available (future)")
+st.caption("Each cell = one 30-min block  ·  🔴 Booked  🟢 Went unbooked  🔵 Still available  ")
 
 if not slots_df.empty:
     status_to_num = {"booked": 0, "went_unbooked": 1, "available": 2}
@@ -222,9 +222,9 @@ if not slots_df.empty:
         x=pivot_num.columns.tolist(),
         y=pivot_num.index.tolist(),
         colorscale=[
-            [0,   "#ff4d6d"],   # booked → red
-            [0.5, "#00ff9d"],   # went_unbooked → green
-            [1.0, "#38bdf8"],   # available (future) → blue
+            [0,   "#ff4d6d"],
+            [0.5, "#00ff9d"],
+            [1.0, "#38bdf8"],
         ],
         showscale=False,
         hovertemplate="<b>%{y}</b><br>%{x}<br>%{text}<extra></extra>",
@@ -269,7 +269,7 @@ if not slots_df.empty:
         fig2.update_yaxes(gridcolor="#1f2937")
         st.plotly_chart(fig2, use_container_width=True)
     else:
-        st.info("No finalised slots yet — data appears as time slots pass.")
+        st.info("No finalised slots yet for this date.")
 
 st.markdown("---")
 
@@ -299,7 +299,7 @@ else:
 
 st.markdown("---")
 
-# ── Raw data table ────────────────────────────────────────────────────────────
+# ── Raw data ──────────────────────────────────────────────────────────────────
 
 with st.expander("📋 Raw slot data", expanded=False):
     if not slots_df.empty:
@@ -312,5 +312,6 @@ with st.expander("📋 Raw slot data", expanded=False):
         st.dataframe(display, use_container_width=True, hide_index=True)
         st.download_button(
             "Download CSV", data=display.to_csv(index=False),
-            file_name=f"padel_slots_{selected_date}.csv", mime="text/csv",
+            file_name=f"padel_slots_{selected_club}_{selected_date}.csv",
+            mime="text/csv",
         )
