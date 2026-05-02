@@ -50,7 +50,13 @@ def get_conn():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_schema():
-    """Create tables if they don't exist. Safe to run on every startup."""
+    """
+    Create/update schema. Safe to run on every startup.
+    Automatically runs migration if club_id column is missing from existing data.
+    """
+    # Run migration first if needed — this is a no-op if already migrated
+    migrate_add_club_id()
+
     with get_conn() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS polls (
