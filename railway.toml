@@ -4,6 +4,6 @@
 # Docs: https://docs.railway.app/reference/config-as-code
 
 [deploy]
-startCommand = "python db.py --migrate && python db.py --init && python playtomic_tracker.py --loop"
+startCommand = "python db.py --init && python playtomic_tracker.py --loop"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
