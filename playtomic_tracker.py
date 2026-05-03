@@ -2,18 +2,14 @@
 playtomic_tracker.py — Multi-club court availability poller
 ============================================================
 Polls all configured clubs every POLL_INTERVAL_SECONDS, converts UTC->AEST,
-expands slots into 30-min blocks, diffs against previous snapshots, writes to
-SQLite, then pushes a JSON export to a GitHub Gist.
+expands slots into 30-min blocks, diffs against previous snapshots, writes
+to PostgreSQL.
 
 To add a new club: add an entry to the CLUBS dict below. That's it.
 
 Usage:
   python playtomic_tracker.py          # one poll of all clubs
   python playtomic_tracker.py --loop   # continuous polling
-
-One-time setup:
-  python db.py --migrate   # add club_id to existing data (run once, then remove)
-  python db.py --init      # create/update schema
 """
 
 import requests
@@ -56,12 +52,11 @@ SPORT_ID              = "PADEL"
 API_BASE              = "https://playtomic.com/api/clubs/availability"
 AEST                  = ZoneInfo("Australia/Sydney")
 BLOCK_MINUTES         = 30
-POLL_INTERVAL_SECONDS = 300   # 5 minutes between full cycles (all clubs)
+POLL_INTERVAL_SECONDS = 300   # 5 minutes between full cycles
 
-# Playtomic stops showing a slot as available a few minutes before its start
-# time even if nobody booked it. If a slot disappears within this many minutes
-# of its start time AND we previously saw it as available, we call it
-# went_unbooked rather than booked.
+# Playtomic stops showing a slot a few minutes before start time even if
+# nobody booked it. If a slot disappears within this many minutes of its
+# start time and we previously saw it as available → went_unbooked.
 PRE_REMOVAL_WINDOW_MINUTES = 15
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,28 +153,18 @@ def parse_response(raw: list, club_cfg: dict, target_date: date) -> dict:
 def update_slot_history(
     target_date:  date,
     club_cfg:     dict,
-    court_blocks: dict,   # from parse_response
-    prev_history: dict,   # loaded from DB via db.get_slot_history_for_date
+    court_blocks: dict,
+    prev_history: dict,
 ) -> dict:
     """
     Diffs current API snapshot against previous state.
     Returns updated history dict ready for db.upsert_slot_states().
-
-    Status rules:
-      - In API response                          → available
-      - Not in response, never seen              → booked
-      - Not in response, last seen within grace window of start → went_unbooked
-      - Not in response, last seen before grace window          → booked
-    Finalisation (slot end time passed):
-      available     → went_unbooked
-      booked        → booked (unchanged)
-      went_unbooked → went_unbooked (unchanged)
     """
-    full_day   = generate_full_day_blocks(club_cfg, target_date)
-    date_str   = target_date.strftime("%Y-%m-%d")
-    now        = now_aest()
-    now_iso    = now.isoformat()
-    updated    = {}
+    full_day = generate_full_day_blocks(club_cfg, target_date)
+    date_str = target_date.strftime("%Y-%m-%d")
+    now      = now_aest()
+    now_iso  = now.isoformat()
+    updated  = {}
 
     all_courts = set(court_blocks.keys()) | set(prev_history.keys())
 
@@ -216,10 +201,8 @@ def update_slot_history(
                 last_seen_str = h.get("last_seen_available")
                 if last_seen_str is not None:
                     last_seen_dt = datetime.fromisoformat(last_seen_str)
-                    mins_from_last_seen_to_start = (
-                        block_dt - last_seen_dt
-                    ).total_seconds() / 60
-                    if mins_from_last_seen_to_start <= PRE_REMOVAL_WINDOW_MINUTES:
+                    mins = (block_dt - last_seen_dt).total_seconds() / 60
+                    if mins <= PRE_REMOVAL_WINDOW_MINUTES:
                         h["status"] = "went_unbooked"
                     else:
                         h["status"] = "booked"
@@ -240,7 +223,6 @@ def update_slot_history(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def poll_club(club_id: str, club_cfg: dict, target_date: date):
-    """Run one full poll cycle for a single club."""
     print(f"  [{club_cfg['display_name']}] Fetching …")
     try:
         raw          = fetch_availability(club_cfg["tenant_id"], target_date)
@@ -277,11 +259,8 @@ def run_poll():
         try:
             poll_club(club_id, club_cfg, target_date)
         except Exception as e:
-            # Log and continue to next club rather than aborting the whole cycle
             print(f"  [ERROR] {club_id}: {e}")
 
-    # Export Gist once after all clubs are done
-    db.export_gist()
     print(f"  Cycle complete.")
 
 # ─────────────────────────────────────────────────────────────────────────────

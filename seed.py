@@ -1,22 +1,28 @@
 """
-recover_may2.py — One-time script to restore May 2nd slot data
-==============================================================
-Run once on Railway startup by temporarily adding it to railway.toml:
-  startCommand = "python recover_may2.py && python db.py --init && python playtomic_tracker.py --loop"
+seed.py — One-time historical data seeder
+==========================================
+Seeds May 2nd (South East Padel, all 60 rows) into the fresh Postgres DB.
+Safe to run multiple times — skips if data already exists.
 
-Then revert railway.toml to remove recover_may2.py after successful deploy.
+Usage:
+  DATABASE_URL=<url> python seed.py
 """
 
-import sqlite3
 import os
-from datetime import datetime
+import sys
+import psycopg2
+import psycopg2.extras
 
-DB_PATH = os.environ.get("DB_PATH", "./tracker_data/padel.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    print("ERROR: DATABASE_URL not set.")
+    sys.exit(1)
 
-# All 60 May 2nd slot rows recovered from Gist revision history
-# Format: (query_date, club_id, court_id, block_time, status,
-#          first_seen_available, last_seen_available, finalised, updated_at)
+# All 60 finalised May 2nd rows for South East Padel
+# (query_date, club_id, court_id, block_time, status,
+#  first_seen_available, last_seen_available, finalised, updated_at)
 MAY2_ROWS = [
+    # Court 1
     ("2026-05-02","south_east_padel","4a5fb5fe-139f-40b0-85e7-634c705d7284","08:00","went_unbooked","2026-05-02T05:41:43.401489+10:00","2026-05-02T07:57:30.461726+10:00",1,"2026-05-02T23:57:43.261687+10:00"),
     ("2026-05-02","south_east_padel","4a5fb5fe-139f-40b0-85e7-634c705d7284","08:30","booked","2026-05-02T05:41:43.401489+10:00","2026-05-02T07:57:30.461726+10:00",1,"2026-05-02T23:57:43.261687+10:00"),
     ("2026-05-02","south_east_padel","4a5fb5fe-139f-40b0-85e7-634c705d7284","09:00","booked",None,None,1,"2026-05-02T23:57:43.261687+10:00"),
@@ -82,44 +88,72 @@ MAY2_ROWS = [
 ]
 
 
-def recover():
-    # Ensure DB and tables exist before trying to insert
-    import subprocess, sys
-    print("[recover] Running db.py --init to ensure schema exists...")
-    subprocess.run([sys.executable, "db.py", "--init"], check=True)
-
-    conn = sqlite3.connect(DB_PATH)
+def seed():
+    conn = psycopg2.connect(DATABASE_URL)
     try:
-        # Check if May 2nd data already exists
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM slot_states WHERE query_date='2026-05-02' AND club_id='south_east_padel'"
-        ).fetchone()[0]
+        with conn.cursor() as cur:
+            # Create tables if they don't exist yet (first ever deploy)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS polls (
+                    id          SERIAL PRIMARY KEY,
+                    polled_at   TEXT NOT NULL,
+                    query_date  TEXT NOT NULL,
+                    club_id     TEXT NOT NULL DEFAULT 'south_east_padel',
+                    success     INTEGER NOT NULL DEFAULT 1,
+                    error_msg   TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS slot_states (
+                    id                   SERIAL PRIMARY KEY,
+                    query_date           TEXT NOT NULL,
+                    club_id              TEXT NOT NULL,
+                    court_id             TEXT NOT NULL,
+                    block_time           TEXT NOT NULL,
+                    status               TEXT NOT NULL,
+                    first_seen_available TEXT,
+                    last_seen_available  TEXT,
+                    finalised            INTEGER NOT NULL DEFAULT 0,
+                    updated_at           TEXT NOT NULL,
+                    UNIQUE (query_date, club_id, court_id, block_time)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_ss_date  ON slot_states (query_date)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_ss_club  ON slot_states (club_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_ss_court ON slot_states (court_id)")
+            conn.commit()
+            print("[seed] Tables ready.")
 
-        if existing > 0:
-            print(f"[recover] May 2nd data already present ({existing} rows) — skipping.")
-            conn.close()
-            return
+            cur.execute(
+                "SELECT COUNT(*) FROM slot_states WHERE query_date='2026-05-02' AND club_id='south_east_padel'"
+            )
+            existing = cur.fetchone()[0]
+            if existing > 0:
+                print(f"[seed] May 2nd already present ({existing} rows) — skipping.")
+                return
 
-        conn.executemany("""
-            INSERT OR IGNORE INTO slot_states
-                (query_date, club_id, court_id, block_time, status,
-                 first_seen_available, last_seen_available, finalised, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?)
-        """, MAY2_ROWS)
-        conn.commit()
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO slot_states
+                    (query_date, club_id, court_id, block_time, status,
+                     first_seen_available, last_seen_available, finalised, updated_at)
+                VALUES %s
+                ON CONFLICT DO NOTHING
+            """, MAY2_ROWS)
+            conn.commit()
 
-        inserted = conn.execute(
-            "SELECT COUNT(*) FROM slot_states WHERE query_date='2026-05-02' AND club_id='south_east_padel'"
-        ).fetchone()[0]
-        print(f"[recover] ✓ Restored {inserted} May 2nd rows for South East Padel.")
+            cur.execute(
+                "SELECT COUNT(*) FROM slot_states WHERE query_date='2026-05-02' AND club_id='south_east_padel'"
+            )
+            inserted = cur.fetchone()[0]
+            print(f"[seed] ✓ Inserted {inserted} May 2nd rows for South East Padel.")
 
     except Exception as e:
         conn.rollback()
-        print(f"[recover] ERROR: {e}")
+        print(f"[seed] ERROR: {e}")
         raise
     finally:
         conn.close()
 
 
 if __name__ == "__main__":
-    recover()
+    seed()
