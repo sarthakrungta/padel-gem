@@ -106,8 +106,24 @@ def migrate_add_club_id():
             print("[migrate] club_id already exists — skipping migration.")
             return
 
-        print("[migrate] Adding club_id to polls table...")
-        conn.execute("ALTER TABLE polls ADD COLUMN club_id TEXT NOT NULL DEFAULT 'south_east_padel'")
+        # Only alter polls if it exists (it may not on a completely fresh DB)
+        polls_exists = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='polls'"
+        ).fetchone()[0]
+        if polls_exists:
+            print("[migrate] Adding club_id to polls table...")
+            conn.execute("ALTER TABLE polls ADD COLUMN club_id TEXT NOT NULL DEFAULT 'south_east_padel'")
+        else:
+            print("[migrate] polls table does not exist yet — skipping ALTER (will be created fresh).")
+
+        # Only recreate slot_states if it exists
+        ss_exists = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='slot_states'"
+        ).fetchone()[0]
+        if not ss_exists:
+            print("[migrate] slot_states does not exist yet — skipping recreation (will be created fresh).")
+            conn.commit()
+            return
 
         print("[migrate] Recreating slot_states with club_id and updated UNIQUE key...")
         conn.executescript("""
@@ -299,18 +315,24 @@ def build_export_payload() -> dict:
     """
     Build the full JSON payload for the dashboard.
     Nested by club_id so the dashboard can filter per club.
+
+    All dates are included in available_dates and utilisation_trend so the
+    full history is always accessible. Raw slot rows (for the heatmap and
+    raw table) are limited to the last 14 days to keep the Gist file small
+    and avoid hitting GitHub's 1MB file size limit.
     """
     club_ids = get_all_club_ids()
     clubs_data = {}
     for club_id in club_ids:
-        dates = get_available_dates(club_id)[:30]
+        all_dates  = get_available_dates(club_id)        # all history, newest first
+        slot_dates = all_dates[:14]                       # raw slots: last 14 days only
         slots_by_date = {}
-        for d in dates:
+        for d in slot_dates:
             slots_by_date[d] = get_slot_states_for_date(date.fromisoformat(d), club_id)
         clubs_data[club_id] = {
-            "available_dates":   dates,
-            "utilisation_trend": get_utilisation_by_date(club_id)[:30],
-            "slots_by_date":     slots_by_date,
+            "available_dates":   all_dates,              # full list for date picker
+            "utilisation_trend": get_utilisation_by_date(club_id),  # full trend
+            "slots_by_date":     slots_by_date,          # last 14 days of detail
         }
     return {
         "exported_at":  datetime.now(tz=AEST).isoformat(),

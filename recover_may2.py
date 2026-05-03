@@ -83,9 +83,10 @@ MAY2_ROWS = [
 
 
 def recover():
-    if not os.path.exists(DB_PATH):
-        print(f"[recover] DB not found at {DB_PATH} — skipping.")
-        return
+    # Ensure DB and tables exist before trying to insert
+    import subprocess, sys
+    print("[recover] Running db.py --init to ensure schema exists...")
+    subprocess.run([sys.executable, "db.py", "--init"], check=True)
 
     conn = sqlite3.connect(DB_PATH)
     try:
