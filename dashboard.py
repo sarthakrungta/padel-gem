@@ -27,6 +27,7 @@ import db
 CLUB_DISPLAY_NAMES = {
     "south_east_padel":    "South East Padel",
     "game4padel_richmond": "Game4Padel Richmond",
+    "ipadel_melbourne":    "iPadel Melbourne",
 }
 
 COURT_LABELS = {
@@ -42,6 +43,12 @@ COURT_LABELS = {
         "b494a00e-f87b-4d2f-9b47-330670234cbb": "Court 4",
         "c7867aac-4ae3-4ed1-b5d9-fce0bee53151": "Court 5",
         "f30f0a7e-8ead-4b17-bbf0-9c6a78da0384": "Court 6",
+    },
+    "ipadel_melbourne": {
+        "7e513f3a-5f80-45f6-baae-9a0342694b8a": "Court 1",
+        "52ae8bbf-b9b4-46f2-b33f-b44d3aa21554": "Court 2",
+        "d9300f9c-2395-4437-9a76-4f5ff9cf273b": "Court 3",
+        "93f308d5-374f-4da4-88b9-9825498f9866": "Court 4",
     },
 }
 

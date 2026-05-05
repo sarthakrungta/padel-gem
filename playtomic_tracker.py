@@ -42,6 +42,27 @@ CLUBS = {
             "weekend": {"open": "08:00", "close": "21:00"},
         },
     },
+    "ipadel_melbourne": {
+        "display_name": "iPadel Melbourne",
+        "tenant_id":    "ad338542-1b25-4b7e-9399-4bce72656352",
+        "opening_hours": {
+            # Per-day keys: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
+            0: {"open": "06:00", "close": "00:00"},  # Mon — closes midnight
+            1: {"open": "06:00", "close": "00:00"},  # Tue
+            2: {"open": "06:00", "close": "00:00"},  # Wed
+            3: {"open": "06:00", "close": "02:00"},  # Thu — closes 2am
+            4: {"open": "06:00", "close": "02:00"},  # Fri
+            5: {"open": "07:00", "close": "02:00"},  # Sat
+            6: {"open": "07:00", "close": "02:00"},  # Sun
+        },
+        # Only track these 4 courts out of the full venue
+        "court_filter": {
+            "7e513f3a-5f80-45f6-baae-9a0342694b8a",
+            "52ae8bbf-b9b4-46f2-b33f-b44d3aa21554",
+            "d9300f9c-2395-4437-9a76-4f5ff9cf273b",
+            "93f308d5-374f-4da4-88b9-9825498f9866",
+        },
+    },
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,15 +98,24 @@ def utc_slot_to_aest(utc_date_str: str, utc_time_str: str) -> datetime:
     return dt_utc.astimezone(AEST)
 
 def get_opening_hours(club_cfg: dict, for_date: date) -> tuple:
-    key = "weekend" if for_date.weekday() >= 5 else "weekday"
-    hours = club_cfg["opening_hours"][key]
-    open_dt  = datetime.strptime(hours["open"],  "%H:%M").replace(
+    # Support both per-day keys (0=Mon..6=Sun) and weekday/weekend keys
+    hours = club_cfg["opening_hours"].get(for_date.weekday())
+    if hours is None:
+        key   = "weekend" if for_date.weekday() >= 5 else "weekday"
+        hours = club_cfg["opening_hours"][key]
+
+    open_dt = datetime.strptime(hours["open"], "%H:%M").replace(
         year=for_date.year, month=for_date.month, day=for_date.day, tzinfo=AEST
     )
-    close_dt = datetime.strptime(hours["close"], "%H:%M").replace(
+
+    # If close time <= open time the venue closes after midnight — add 1 day
+    close_base = datetime.strptime(hours["close"], "%H:%M").replace(
         year=for_date.year, month=for_date.month, day=for_date.day, tzinfo=AEST
     )
-    return open_dt, close_dt
+    if close_base <= open_dt:
+        close_base += timedelta(days=1)
+
+    return open_dt, close_base
 
 def generate_full_day_blocks(club_cfg: dict, for_date: date) -> list:
     """All expected 30-min block start times (HH:MM) for this club/date."""
@@ -125,8 +155,15 @@ def parse_response(raw: list, club_cfg: dict, target_date: date) -> dict:
     open_dt, close_dt = get_opening_hours(club_cfg, target_date)
     court_blocks: dict = {}
 
+    court_filter = club_cfg.get("court_filter")
+
     for entry in raw:
         court_id = entry["resource_id"]
+
+        # Skip courts not in the filter (if one is defined)
+        if court_filter and court_id not in court_filter:
+            continue
+
         utc_date = entry["start_date"]
 
         for slot in entry.get("slots", []):
