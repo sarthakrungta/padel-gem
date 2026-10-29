@@ -55,13 +55,6 @@ CLUBS = {
             5: {"open": "07:00", "close": "02:00"},  # Sat
             6: {"open": "07:00", "close": "02:00"},  # Sun
         },
-        # Only track these 4 courts out of the full venue
-        "court_filter": {
-            "7e513f3a-5f80-45f6-baae-9a0342694b8a",
-            "52ae8bbf-b9b4-46f2-b33f-b44d3aa21554",
-            "d9300f9c-2395-4437-9a76-4f5ff9cf273b",
-            "93f308d5-374f-4da4-88b9-9825498f9866",
-        },
     },
 }
 

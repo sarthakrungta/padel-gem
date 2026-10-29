@@ -49,6 +49,12 @@ COURT_LABELS = {
         "52ae8bbf-b9b4-46f2-b33f-b44d3aa21554": "Court 2",
         "d9300f9c-2395-4437-9a76-4f5ff9cf273b": "Court 3",
         "93f308d5-374f-4da4-88b9-9825498f9866": "Court 4",
+        "93dadcbd-4ab1-497d-b8b6-680411fbe98c": "Ball Machine",
+        "bdb06fb1-3163-4402-ab0d-3abc68e25c35": "Sauna Male",
+        "03aba24a-0781-4be0-bc80-38192c5ee44a": "Ice bath Female",
+        "870a909a-1cbe-4611-bf11-e92d5f14181a": "Ice bath Male",
+        "aefde504-576a-4e4b-880f-213500011639": "Sauna Female",
+
     },
 }
 
